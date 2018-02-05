@@ -33,85 +33,36 @@
 #include <pthread.h>
 #include <linux/limits.h>
 #include <libudev.h>
+#include <pcap/pcap.h>
+#include <pcap/usb.h>
 
-//#define BLOCKING_IO
-#define THREADS_COUNT       2
-#define MSEC_10             10000
-#define MSEC_100            100000
-#define USBMON_DEVICE       "/dev/usbmon"
-#define MAX_PACKETS         32
-#define SETUP_LEN           8
 
-struct usbmon_packet {
-    uint64_t id;                    /*  0: URB ID - from submission to callback */
-    uint8_t type;                   /*  8: Same as text; extensible. */
-    uint8_t xfer_type;              /*    ISO (0), Intr, Control, Bulk (3) */
-    uint8_t epnum;                  /*     Endpoint number and transfer direction */
-    uint8_t devnum;                 /*     Device address */
-    uint16_t busnum;                /* 12: Bus number */
-    char flag_setup;                /* 14: Same as text */
-    char flag_data;                 /* 15: Same as text; Binary zero is OK. */
-    int64_t ts_sec;                 /* 16: gettimeofday */
-    int32_t ts_usec;                /* 24: gettimeofday */
-    int32_t status;                 /* 28: */
-    uint32_t length;                /* 32: Length of data (submitted or actual) */
-    uint32_t len_cap;               /* 36: Delivered length */
-    union {                         /* 40: */
-        uint8_t setup[SETUP_LEN];   /* Only for Control S-type */
-        struct iso_rec {            /* Only for ISO */
-            int32_t error_count;
-            int32_t numdesc;
-        } iso;
-    } s;
-    int32_t interval;               /* 48: Only for Interrupt and ISO */
-    int32_t start_frame;            /* 52: For ISO */
-    uint32_t xfer_flags;            /* 56: copy of URB's transfer_flags */
-    uint32_t ndesc;                 /* 60: Actual number of ISO descriptors */
-};                                  /* 64 total length */
-
-struct mon_mfetch_arg {
-    uint32_t *offvec;               /* Vector of events fetched */
-    uint32_t nfetch;                /* Number of events to fetch (out: fetched) */
-    uint32_t nflush;                /* Number of events to flush */
-};
-
-struct mon_bin_stats {
-    uint32_t queued;                /* Number of events currently queued */
-    uint32_t dropped;               /* Number of events lost since last call */
-};
+#define  THREADS_COUNT  2
 
 typedef struct {
-    sigset_t                sMask;
-    int32_t                 busNum;
-    int32_t                 devNum;
-    char                    devPath[PATH_MAX];
-    char*                   idVendor;
-    char*                   idProduct;
-    int32_t                 runSnooper;
-    int32_t                 usbmonFd;
-    FILE*                   outputFile;
-    uint8_t*                mbuf;
-    int32_t                 kbufLen;
-    int32_t                 totalEvents;
-    struct mon_mfetch_arg   fetch;
-    pthread_t               thread[THREADS_COUNT];
+    sigset_t        sMask;
+    int32_t         busNum;
+    int32_t         devNum;
+    char            devPath[PATH_MAX];
+    char*           idVendor;
+    char*           idProduct;
+    int32_t         runSnooper;
+    int32_t         usbmonFd;
+    char            outputFile[PATH_MAX];
+    pcap_t*         pcapHandle;
+    pcap_dumper_t*  pcapFile;
+    int32_t         append;
+    int32_t         totalEvents;
+    int32_t         filteredEvents;
+    pthread_t       thread[THREADS_COUNT];
 } threadArgs_t;
-
-#define MON_IOC_MAGIC       0x92
-#define MON_IOCQ_URB_LEN    _IO(MON_IOC_MAGIC, 1)
-#define MON_IOCG_STATS      _IOR(MON_IOC_MAGIC, 3, struct mon_bin_stats)
-#define MON_IOCT_RING_SIZE  _IO(MON_IOC_MAGIC, 4)
-#define MON_IOCQ_RING_SIZE  _IO(MON_IOC_MAGIC, 5)
-//#define MON_IOCX_GET        _IOW(MON_IOC_MAGIC, 6, struct mon_bin_get)
-#define MON_IOCX_MFETCH     _IOWR(MON_IOC_MAGIC, 7, struct mon_mfetch_arg)
-#define MON_IOCH_MFLUSH     _IO(MON_IOC_MAGIC, 8)
 
 static struct udev* udev;
 static struct udev_device* dev;
 static struct udev_monitor* mon;
 static threadArgs_t tArgs  = { 0 };
-static pthread_mutex_t usbmonFd_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  usbmonFd_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t runSnooper_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  runSnooper_cond = PTHREAD_COND_INITIALIZER;
 
 void sigHandler( int32_t sigNum, siginfo_t* sigInfo, void* ctx ) {
     for( int32_t i = 0; i < THREADS_COUNT; i++ ) {
@@ -120,32 +71,38 @@ void sigHandler( int32_t sigNum, siginfo_t* sigInfo, void* ctx ) {
 }
 
 void usbSnooperCleanUp( void* arg ) {
-    struct mon_bin_stats stats = { 0 };
+    struct pcap_stat stats = { 0 };
 
-    if( tArgs.mbuf ) {
-        ioctl( tArgs.usbmonFd, MON_IOCH_MFLUSH, tArgs.fetch.nfetch );
-        int32_t ret = ioctl( tArgs.usbmonFd, MON_IOCG_STATS, &stats );
+    if( tArgs.pcapHandle ) {
+        int32_t ret = pcap_stats( tArgs.pcapHandle, &stats );
         if( ret == 0 ) {
-            fprintf( stderr, "\n%d events captured\n", tArgs.totalEvents );
-            fprintf( stderr, "%d events received by filter\n", tArgs.totalEvents + stats.queued );
-            fprintf( stderr, "%d events dropped by kernel\n", stats.dropped );
+            fprintf( stderr, "\n%d events captured\n", stats.ps_recv );
+            fprintf( stderr, "%d events dropped by kernel\n", stats.ps_drop );
+            fprintf( stderr, "%d events dropped by driver\n", stats.ps_ifdrop );
         }
-        munmap( tArgs.mbuf, tArgs.kbufLen << 1 );
-        close( tArgs.usbmonFd );
-        tArgs.usbmonFd = -1;
-        tArgs.mbuf = NULL;
+        pcap_dump_close( tArgs.pcapFile );
+        pcap_close( tArgs.pcapHandle );
+        tArgs.pcapHandle = NULL;
+        tArgs.pcapFile = NULL;
     }
+}
+
+void pcapCallback( u_char* bp, const struct pcap_pkthdr* header, const u_char* data ) {
+    tArgs.totalEvents++;
+    pcap_usb_header* usb_header = (pcap_usb_header*)data;
+    if( usb_header->device_address == tArgs.devNum ) {
+        tArgs.filteredEvents++;
+        //fwrite( &tArgs.mbuf[vec[i]], hdr->len_cap + sizeof( struct usbmon_packet ), 1, tArgs.outputFile );
+        pcap_dump( (u_char*)tArgs.pcapFile, header, data );
+    }
+    fprintf( stderr, "Total events #: %d, filtered events #: %d\r", tArgs.totalEvents, tArgs.filteredEvents );
 }
 
 void* usbSnooper( void* argP ) {
     int32_t run = 1;
 
-    struct usbmon_packet *hdr;
-    int32_t nflush;
-    uint32_t vec[MAX_PACKETS];
-    uint32_t i;
-    void* addr;
-
+    char errBuf[PCAP_ERRBUF_SIZE] = { 0 };
+    char deviceName[16];
     fd_set fdRecFrom;
     int32_t ret;
 
@@ -154,32 +111,20 @@ void* usbSnooper( void* argP ) {
     while( run ) {
         usbSnooperCleanUp( NULL );
 
-        pthread_mutex_lock( &usbmonFd_lock );
-        while( tArgs.usbmonFd <= 0 )
-            pthread_cond_wait( &usbmonFd_cond, &usbmonFd_lock );
-        pthread_mutex_unlock( &usbmonFd_lock );
+        pthread_mutex_lock( &runSnooper_lock );
+        while( !tArgs.runSnooper )
+            pthread_cond_wait( &runSnooper_cond, &runSnooper_lock );
+        pthread_mutex_unlock( &runSnooper_lock );
 
-        /* Create circular buffer */
-        if( ( tArgs.kbufLen = ioctl( tArgs.usbmonFd, MON_IOCQ_RING_SIZE ) ) < 0 ) {
-            fprintf( stderr, "ioctl query for kernel USB ring buffer size failed: %s\n", strerror( errno ) );
-            pthread_exit( NULL );
+        snprintf( deviceName, 16, "usbmon%d", tArgs.busNum );
+        tArgs.pcapHandle = pcap_open_live( deviceName, 65536, 1, 1000, errBuf );
+        pcap_setnonblock( tArgs.pcapHandle, 1, errBuf );
+        if( tArgs.append ) {
+            tArgs.pcapFile = pcap_dump_open_append( tArgs.pcapHandle, tArgs.outputFile );
+        } else {
+            tArgs.pcapFile = pcap_dump_open( tArgs.pcapHandle, tArgs.outputFile );
         }
-
-        if( ( tArgs.mbuf = (uint8_t*)mmap( NULL, tArgs.kbufLen << 1, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0 ) ) == MAP_FAILED ) {
-            fprintf( stderr, "mmap call #1 for underlying double sized private map failed: %s\n", strerror( errno ) );
-            pthread_exit( NULL );
-        }
-        if( ( addr = (uint8_t*)mmap( tArgs.mbuf, tArgs.kbufLen, PROT_READ, MAP_FIXED | MAP_SHARED, tArgs.usbmonFd, 0 ) ) != tArgs.mbuf ) {
-            fprintf( stderr, "mmap call #2 for 1st half mirror shared map failed: %s\n", strerror( errno ) );
-            pthread_exit( NULL );
-        }
-        if( ( addr = (uint8_t*)mmap( tArgs.mbuf + tArgs.kbufLen, tArgs.kbufLen, PROT_READ, MAP_FIXED | MAP_SHARED, tArgs.usbmonFd, 0 ) ) != tArgs.mbuf + tArgs.kbufLen ) {
-            fprintf( stderr, "mmap call #3 for 2nd half mirror shared map failed: %s\n", strerror( errno ) );
-            pthread_exit( NULL );
-        }
-
-        fprintf( stderr, "Kernel USB ring buffer size: %d bytes\n", tArgs.kbufLen );
-        nflush = 0;
+        tArgs.usbmonFd = pcap_get_selectable_fd( tArgs.pcapHandle );
 
         while( tArgs.runSnooper ) {
             FD_ZERO( &fdRecFrom );
@@ -187,30 +132,9 @@ void* usbSnooper( void* argP ) {
 
             ret = pselect( tArgs.usbmonFd + 1, &fdRecFrom, NULL, NULL, NULL, &tArgs.sMask );
             if( ret > 0 && FD_ISSET( tArgs.usbmonFd, &fdRecFrom ) ) {
-                tArgs.fetch.offvec = vec;
-                tArgs.fetch.nfetch = MAX_PACKETS;
-                tArgs.fetch.nflush = nflush;
-#ifdef BLOCKING_IO
-                ioctl( tArgs.usbmonFd, MON_IOCX_MFETCH, &tArgs.fetch );
-#else
-                int32_t ioRet = 0;
-                do {
-                    ioRet = ioctl( tArgs.usbmonFd, MON_IOCX_MFETCH, &tArgs.fetch );
-                    if( ioRet < 0 ) {
-                        usleep( MSEC_10 );
-                    }
-                } while( ioRet < 0 && errno == EWOULDBLOCK );
-#endif
-                nflush = tArgs.fetch.nfetch;
-                tArgs.totalEvents += nflush;
-                for( i = 0; i < nflush; i++ ) {
-                    hdr = ( struct usbmon_packet* ) &tArgs.mbuf[vec[i]];
-                    if( hdr->busnum == tArgs.busNum && hdr->devnum == tArgs.devNum ) {
-                        if( hdr->len_cap ) {
-                            //fprintf( stderr, "From offset %ld, len_cap: %d bytes, length: %d\n", &tArgs.mbuf[vec[i]] - tArgs.mbuf, hdr->len_cap, hdr->length );
-                            fwrite( &tArgs.mbuf[vec[i]], hdr->len_cap + sizeof( struct usbmon_packet ), 1, tArgs.outputFile );
-                        }
-                    }
+                if( pcap_dispatch( tArgs.pcapHandle, 1, pcapCallback, NULL ) < 0 ) {
+                     fprintf( stderr, "pcap_dispatch: %s\n", pcap_geterr( tArgs.pcapHandle ) );
+                     pthread_exit( NULL );
                 }
             }
         }
@@ -219,19 +143,6 @@ void* usbSnooper( void* argP ) {
     pthread_cleanup_pop( 1 );
 
     pthread_exit( NULL );
-}
-
-void openUSBMonitorFd( int* fd, const int32_t bus ) {
-    char path[PATH_MAX];
-#ifdef BLOCKING_IO
-    int32_t flags = O_RDONLY;
-#else
-    int32_t flags = O_RDONLY | O_NONBLOCK;
-#endif    
-    snprintf( path, PATH_MAX - 1, "%s%d", USBMON_DEVICE, bus );
-    if( ( *fd = open( path, flags ) ) == -1 ) {
-        fprintf( stderr, "unable to open %s: %s\n", path, strerror( errno ) );
-    }
 }
 
 void matchUSBDevice( struct udev_device* dev ) {
@@ -244,13 +155,10 @@ void matchUSBDevice( struct udev_device* dev ) {
         tArgs.busNum = atoi( udev_device_get_sysattr_value( dev, "busnum" ) );
         tArgs.devNum = atoi( udev_device_get_sysattr_value( dev, "devnum" ) );
 
-        pthread_mutex_lock( &usbmonFd_lock );
-        openUSBMonitorFd( &tArgs.usbmonFd, tArgs.busNum );
-        pthread_mutex_unlock( &usbmonFd_lock );
-        if( tArgs.usbmonFd > 0 ) {
-            tArgs.runSnooper = 1;
-            pthread_cond_signal( &usbmonFd_cond );
-        }
+        pthread_mutex_lock( &runSnooper_lock );
+        tArgs.runSnooper = 1;
+        pthread_mutex_unlock( &runSnooper_lock );
+        pthread_cond_signal( &runSnooper_cond );
     }
 }
 
@@ -362,8 +270,11 @@ int main( int32_t argc, char** argv ) {
     int32_t opt;
     int32_t mandatoryOpts = 0;
 
-    while( ( opt = getopt( argc, argv, "d:f:" ) ) != -1 ) {
+    while( ( opt = getopt( argc, argv, "ad:f:" ) ) != -1 ) {
         switch ( opt ) {
+        case 'a':
+            tArgs.append = 1;
+            break;
         case 'd':
             if( strlen( optarg ) != 9 || strspn( optarg, "01234567890abcdef:" ) != 9 ) {
                 usage1();
@@ -375,10 +286,8 @@ int main( int32_t argc, char** argv ) {
             }
             break;
         case 'f':
-            if( optarg && ( tArgs.outputFile = fopen( optarg, "w+b" ) ) == NULL ) {
-                fprintf( stderr, "Could not open %s for writing data: %s\n", optarg, strerror( errno ) );
-                return( -1 );
-            }
+            strncpy( tArgs.outputFile, optarg, PATH_MAX );
+            tArgs.outputFile[PATH_MAX-1] = 0;
             mandatoryOpts++;
             break;
         }
@@ -387,6 +296,12 @@ int main( int32_t argc, char** argv ) {
     if( mandatoryOpts < 2 ) {
         usage2( *argv );
         return( -1 );
+    }
+
+    /* Check if output file exist already */
+    if( access( tArgs.outputFile, F_OK | W_OK ) != 0 ) {
+        /* File will be created */
+        tArgs.append = 0;
     }
 
     /* Block all but SIGINT and SIGTERM */
@@ -419,8 +334,5 @@ int main( int32_t argc, char** argv ) {
 fail_out:
     free( tArgs.idVendor );
     free( tArgs.idProduct );
-    if( tArgs.outputFile ) {
-        fclose( tArgs.outputFile );
-    }
     return( 0 );
 }
