@@ -92,7 +92,6 @@ void pcapCallback( u_char* bp, const struct pcap_pkthdr* header, const u_char* d
     pcap_usb_header* usb_header = (pcap_usb_header*)data;
     if( usb_header->device_address == tArgs.devNum ) {
         tArgs.filteredEvents++;
-        //fwrite( &tArgs.mbuf[vec[i]], hdr->len_cap + sizeof( struct usbmon_packet ), 1, tArgs.outputFile );
         pcap_dump( (u_char*)tArgs.pcapFile, header, data );
     }
     fprintf( stderr, "Total events #: %d, filtered events #: %d\r", tArgs.totalEvents, tArgs.filteredEvents );
@@ -117,7 +116,11 @@ void* usbSnooper( void* argP ) {
         pthread_mutex_unlock( &runSnooper_lock );
 
         snprintf( deviceName, 16, "usbmon%d", tArgs.busNum );
-        tArgs.pcapHandle = pcap_open_live( deviceName, 65536, 1, 1000, errBuf );
+        if( ( tArgs.pcapHandle = pcap_open_live( deviceName, 65536, 1, 1000, errBuf ) ) == NULL ) {
+            fprintf( stderr, "pcap_open_live: %s\n", errBuf );
+            tArgs.runSnooper = 0;
+            continue;
+        }
         pcap_setnonblock( tArgs.pcapHandle, 1, errBuf );
         if( tArgs.append ) {
             tArgs.pcapFile = pcap_dump_open_append( tArgs.pcapHandle, tArgs.outputFile );
@@ -134,7 +137,7 @@ void* usbSnooper( void* argP ) {
             if( ret > 0 && FD_ISSET( tArgs.usbmonFd, &fdRecFrom ) ) {
                 if( pcap_dispatch( tArgs.pcapHandle, 1, pcapCallback, NULL ) < 0 ) {
                      fprintf( stderr, "pcap_dispatch: %s\n", pcap_geterr( tArgs.pcapHandle ) );
-                     pthread_exit( NULL );
+                     tArgs.runSnooper = 0;
                 }
             }
         }
