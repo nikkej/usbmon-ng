@@ -1,6 +1,5 @@
 # usbmon-ng
-Next generation USB traffic monitoring application which utilizes threads and libudev for device presence detection at application start up, and device attach & detach events as well.
+Next generation and yet another USB traffic monitoring application which utilizes threads and libudev for device presence detection at application start up, and device attach & detach events as well. PCap library is used to read USB URBs and to store those into file for further processing. Conceptual state chart about thread interactions & life cycles depicted below
 
-Done: mmap'ed ioctl abandoned, now pcap library reads pseudo file handle and dumps pcap data to file.
+..figure :: doc/usbmon-ng-threads.jpeg
 
-ToDo: More error checking & handling...
