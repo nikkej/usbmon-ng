@@ -46,7 +46,6 @@ typedef struct {
     char            devPath[PATH_MAX];
     char*           idVendor;
     char*           idProduct;
-    int32_t         runSnooper;
     int32_t         usbmonFd;
     char            outputFile[PATH_MAX];
     pcap_t*         pcapHandle;
@@ -61,6 +60,7 @@ static struct udev* udev;
 static struct udev_device* dev;
 static struct udev_monitor* mon;
 static threadArgs_t tArgs  = { 0 };
+static volatile int32_t runSnooper;
 static pthread_mutex_t runSnooper_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  runSnooper_cond = PTHREAD_COND_INITIALIZER;
 
@@ -111,14 +111,16 @@ void* usbSnooper( void* argP ) {
         usbSnooperCleanUp( NULL );
 
         pthread_mutex_lock( &runSnooper_lock );
-        while( !tArgs.runSnooper )
+        while( !runSnooper )
             pthread_cond_wait( &runSnooper_cond, &runSnooper_lock );
         pthread_mutex_unlock( &runSnooper_lock );
 
         snprintf( deviceName, 16, "usbmon%d", tArgs.busNum );
         if( ( tArgs.pcapHandle = pcap_open_live( deviceName, 65536, 1, 1000, errBuf ) ) == NULL ) {
             fprintf( stderr, "pcap_open_live: %s\n", errBuf );
-            tArgs.runSnooper = 0;
+            pthread_mutex_lock( &runSnooper_lock );
+            runSnooper = 0;
+            pthread_mutex_unlock( &runSnooper_lock );
             continue;
         }
         pcap_setnonblock( tArgs.pcapHandle, 1, errBuf );
@@ -129,7 +131,7 @@ void* usbSnooper( void* argP ) {
         }
         tArgs.usbmonFd = pcap_get_selectable_fd( tArgs.pcapHandle );
 
-        while( tArgs.runSnooper ) {
+        while( runSnooper ) {
             FD_ZERO( &fdRecFrom );
             FD_SET( tArgs.usbmonFd, &fdRecFrom );
 
@@ -137,7 +139,9 @@ void* usbSnooper( void* argP ) {
             if( ret > 0 && FD_ISSET( tArgs.usbmonFd, &fdRecFrom ) ) {
                 if( pcap_dispatch( tArgs.pcapHandle, 1, pcapCallback, NULL ) < 0 ) {
                      fprintf( stderr, "pcap_dispatch: %s\n", pcap_geterr( tArgs.pcapHandle ) );
-                     tArgs.runSnooper = 0;
+                     pthread_mutex_lock( &runSnooper_lock );
+                     runSnooper = 0;
+                     pthread_mutex_unlock( &runSnooper_lock );
                 }
             }
         }
@@ -159,7 +163,7 @@ void matchUSBDevice( struct udev_device* dev ) {
         tArgs.devNum = atoi( udev_device_get_sysattr_value( dev, "devnum" ) );
 
         pthread_mutex_lock( &runSnooper_lock );
-        tArgs.runSnooper = 1;
+        runSnooper = 1;
         pthread_mutex_unlock( &runSnooper_lock );
         pthread_cond_signal( &runSnooper_cond );
     }
@@ -244,7 +248,9 @@ void* udevEventListener( void* argP ) {
                      * and this branch waits for device descriptor path which seems
                      * to come with last remove event */
                     /* suspend snoop thread */
-                    tArgs.runSnooper = 0;
+                    pthread_mutex_lock( &runSnooper_lock );
+                    runSnooper = 0;
+                    pthread_mutex_unlock( &runSnooper_lock );
                 }
                 udev_device_unref( dev );
                 dev = NULL;
