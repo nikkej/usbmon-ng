@@ -94,7 +94,7 @@ void pcapCallback( u_char* bp, const struct pcap_pkthdr* header, const u_char* d
         tArgs.filteredEvents++;
         pcap_dump( (u_char*)tArgs.pcapFile, header, data );
     }
-    fprintf( stderr, "Total events #: %d, filtered events #: %d\r", tArgs.totalEvents, tArgs.filteredEvents );
+    fprintf( stderr, "Total events on bus #: %d, device events #: %d\r", tArgs.totalEvents, tArgs.filteredEvents );
 }
 
 void* usbSnooper( void* argP ) {
@@ -157,7 +157,7 @@ void matchUSBDevice( struct udev_device* dev ) {
     const char* p = udev_device_get_sysattr_value( dev, "idProduct" );
     if( ( v && p && tArgs.idVendor && tArgs.idProduct ) \
     && strncmp( tArgs.idVendor, v, 4 ) == 0 \
-    &&  strncmp( tArgs.idProduct, p, 4 ) == 0 ) {
+    && strncmp( tArgs.idProduct, p, 4 ) == 0 ) {
         strncpy( tArgs.devPath, udev_device_get_devpath( dev ), PATH_MAX - 1 );
         tArgs.busNum = atoi( udev_device_get_sysattr_value( dev, "busnum" ) );
         tArgs.devNum = atoi( udev_device_get_sysattr_value( dev, "devnum" ) );
@@ -269,9 +269,10 @@ void usage1( void ) {
 }
 
 void usage2( char* exeName ) {
-    fprintf( stderr, "Usage: \n" );
-    fprintf( stderr, "%s -d <vId:pId> where both Id's are given in hexadecimal\n", exeName );
-    fprintf( stderr, " -f <filename> where file name refers to binary output data\n" );
+    fprintf( stderr, "Usage: %s -df[a]\n", exeName );
+    fprintf( stderr, "  -a            Append to existing pcap file\n" );
+    fprintf( stderr, "  -d <vId:pId>  Where both Id's are given in hexadecimal\n" );
+    fprintf( stderr, "  -f <filename> Where file name refers to binary output data\n" );
 }
 
 int main( int32_t argc, char** argv ) {
