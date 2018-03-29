@@ -51,6 +51,7 @@ typedef struct {
     pcap_t*         pcapHandle;
     pcap_dumper_t*  pcapFile;
     int32_t         append;
+    int32_t         snapLength;
     int32_t         totalEvents;
     int32_t         filteredEvents;
     pthread_t       thread[THREADS_COUNT];
@@ -116,7 +117,7 @@ void* usbSnooper( void* argP ) {
         pthread_mutex_unlock( &runSnooper_lock );
 
         snprintf( deviceName, 16, "usbmon%d", tArgs.busNum );
-        if( ( tArgs.pcapHandle = pcap_open_live( deviceName, 65536, 1, 1000, errBuf ) ) == NULL ) {
+        if( ( tArgs.pcapHandle = pcap_open_live( deviceName, tArgs.snapLength, 1, 1000, errBuf ) ) == NULL ) {
             fprintf( stderr, "pcap_open_live: %s\n", errBuf );
             pthread_mutex_lock( &runSnooper_lock );
             runSnooper = 0;
@@ -269,10 +270,11 @@ void usage1( void ) {
 }
 
 void usage2( char* exeName ) {
-    fprintf( stderr, "Usage: %s -df[a]\n", exeName );
+    fprintf( stderr, "Usage: %s -df[as]\n", exeName );
     fprintf( stderr, "  -a            Append to existing pcap file\n" );
     fprintf( stderr, "  -d <vId:pId>  Where both Id's are given in hexadecimal\n" );
     fprintf( stderr, "  -f <filename> Where file name refers to binary output data\n" );
+    fprintf( stderr, "  -s snaplen    Snapshot length to be captured\n" );
 }
 
 int main( int32_t argc, char** argv ) {
@@ -280,7 +282,7 @@ int main( int32_t argc, char** argv ) {
     int32_t opt;
     int32_t mandatoryOpts = 0;
 
-    while( ( opt = getopt( argc, argv, "ad:f:" ) ) != -1 ) {
+    while( ( opt = getopt( argc, argv, "ad:f:s:" ) ) != -1 ) {
         switch ( opt ) {
         case 'a':
             tArgs.append = 1;
@@ -300,12 +302,20 @@ int main( int32_t argc, char** argv ) {
             tArgs.outputFile[PATH_MAX-1] = 0;
             mandatoryOpts++;
             break;
+        case 's':
+            tArgs.snapLength = atoi( optarg );
+            break;
         }
     }
 
     if( mandatoryOpts < 2 ) {
         usage2( *argv );
         return( -1 );
+    }
+
+    /* Ensure there's always nonzero snapshot length */
+    if( tArgs.snapLength <= 0 ) {
+        tArgs.snapLength = 65536;
     }
 
     /* Check if output file exist already */
